@@ -1,0 +1,284 @@
+{
+  "name": "End of Call to CRM (No BS AI template)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "end-of-call",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "266a2900-2faf-424c-b1d8-f4c6b18a8edf",
+      "name": "End of Call",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "2146334c-4417-4ca0-8bc1-818489e9b8ba"
+    },
+    {
+      "parameters": {
+        "jsCode": "// EDIT THESE. Sample values only. Do not put API tokens here.\nconst settings = {\n  business_name: 'Sample Barber Shop',\n  // Your GHL location (sub-account) ID. Leave as REPLACE_ME to skip the CRM write and only test parsing + dedupe.\n  ghl_location_id: 'REPLACE_ME',\n  ghl_api_url: 'https://services.leadconnectorhq.com/contacts/upsert',\n  ghl_api_version: '2021-07-28',\n  // Optional. If set, a short summary is POSTed here on a new call only (Slack or similar incoming webhook).\n  owner_webhook_url: '',\n  timezone: 'America/New_York',\n  tag_new_call: 'end-of-call',\n  tag_text_back: 'text-back-queued',\n};\n\nreturn $input.all().map(item => ({ json: { ...item.json, settings } }));\n"
+      },
+      "id": "df6b322d-6906-4b45-ba23-e0336c7b844a",
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accepts a Vapi end-of-call-report, a Twilio status/hangup callback, or a simple test payload.\nconst item = $input.first().json;\nconst settings = item.settings;\nconst body = item.body !== undefined ? item.body : item;\n\nconst message = (body && body.message) ? body.message : body;\nconst msgType = message && message.type;\n\nlet source_provider = 'generic';\nlet call_id = '';\nlet caller_phone = '';\nlet dialed_number = '';\nlet caller_name = '';\nlet summary = '';\n\nif (msgType === 'end-of-call-report' || (body && body.message && body.message.call)) {\n  source_provider = 'vapi';\n  const call = message.call || {};\n  const customer = message.customer || call.customer || {};\n  const phoneNumber = message.phoneNumber || {};\n  const analysis = message.analysis || {};\n  const structured = analysis.structuredData || {};\n  call_id = call.id || '';\n  caller_phone = customer.number || '';\n  dialed_number = phoneNumber.number || '';\n  caller_name = structured.name || customer.name || '';\n  summary = analysis.summary || structured.summary || '';\n} else if (body && (body.CallSid || body.call_session_id)) {\n  source_provider = 'twilio';\n  call_id = body.CallSid || body.call_session_id || '';\n  caller_phone = body.From || body.from || '';\n  dialed_number = body.To || body.to || '';\n  caller_name = body.CallerName || body.caller_name || '';\n  summary = body.CallStatus || body.event_type || '';\n} else {\n  call_id = body.call_id || body.callId || body.id || '';\n  caller_phone = body.caller_phone || body.phone || '';\n  dialed_number = body.dialed_number || body.to || '';\n  caller_name = body.caller_name || body.name || '';\n  summary = body.summary || '';\n}\n\nconst missing = [];\nif (!call_id) missing.push('call_id');\nif (!caller_phone) missing.push('caller_phone');\n\nreturn [{\n  json: {\n    settings,\n    source_provider,\n    event_type: msgType || body.CallStatus || 'test',\n    call_id,\n    caller_phone,\n    dialed_number,\n    caller_name,\n    summary,\n    valid: missing.length === 0,\n    missing_fields: missing,\n    raw_preview: JSON.stringify(body).slice(0, 500),\n  }\n}];\n"
+      },
+      "id": "9b07337e-51a7-430a-ad38-6a3472f040be",
+      "name": "Parse Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Remembers call IDs in this workflow's static data.\n// This only persists while the workflow is Active, not during a one-off manual test.\nconst item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.seen_calls) staticData.seen_calls = {};\n\nconst now = Date.now();\nconst maxAgeMs = 7 * 24 * 60 * 60 * 1000;\nfor (const [id, ts] of Object.entries(staticData.seen_calls)) {\n  if (now - ts > maxAgeMs) delete staticData.seen_calls[id];\n}\n\n// Cap the list so it cannot grow forever.\nconst ids = Object.keys(staticData.seen_calls);\nif (ids.length > 500) {\n  ids.sort((a, b) => staticData.seen_calls[a] - staticData.seen_calls[b]);\n  for (const id of ids.slice(0, ids.length - 500)) delete staticData.seen_calls[id];\n}\n\nlet is_duplicate = false;\nlet skip_reason = '';\n\nif (!item.valid) {\n  skip_reason = 'missing ' + item.missing_fields.join(', ');\n} else if (staticData.seen_calls[item.call_id]) {\n  is_duplicate = true;\n  skip_reason = 'call_id already processed';\n} else {\n  staticData.seen_calls[item.call_id] = now;\n}\n\nreturn [{\n  json: {\n    ...item,\n    is_duplicate,\n    skip_reason,\n    write_to_ghl: !is_duplicate && item.valid && item.settings.ghl_location_id && item.settings.ghl_location_id !== 'REPLACE_ME',\n    notify_owner: !is_duplicate && item.valid && !!(item.settings.owner_webhook_url),\n  }\n}];\n"
+      },
+      "id": "93259061-6082-41db-b977-c05e9d245766",
+      "name": "Dedupe Call ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ed1829a7-6ff1-4786-b2f3-6f837cb86c63",
+              "leftValue": "={{ $json.write_to_ghl }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "aa7f9082-1019-43a9-9b19-b0caa5a22b8f",
+      "name": "Write to GHL?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.settings.ghl_api_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "={{ $json.settings.ghl_api_version }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ locationId: $json.settings.ghl_location_id, phone: $json.caller_phone, name: $json.caller_name || undefined, source: 'end-of-call', tags: [$json.settings.tag_new_call, $json.settings.tag_text_back, $json.source_provider].filter(Boolean) }) }}",
+        "options": {}
+      },
+      "id": "bbbaee50-2c6b-4faf-a36e-6aadf49546da",
+      "name": "Upsert GHL Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "99f49547-3b53-44ee-8e25-576664efc04e",
+              "leftValue": "={{ $json.notify_owner }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7bfb6476-77b8-4ad2-80de-25110888a3f2",
+      "name": "Notify Owner?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.settings.owner_webhook_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: 'New call for ' + $json.settings.business_name + ': ' + ($json.caller_name || 'Unknown') + ' ' + $json.caller_phone + ' (' + $json.source_provider + '). ' + ($json.summary || 'No summary.') }) }}",
+        "options": {}
+      },
+      "id": "ef19dbd3-bad5-4a5b-852c-3faf9e26acbe",
+      "name": "Owner Webhook",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## End of Call to CRM (no duplicates)\nBuilt by Bobby Ve, No BS AI.\n\n1. Edit the **Settings** node.\n2. Add a Header Auth credential to **Upsert GHL Contact**. Name: Authorization. Value: Bearer YOUR_GHL_TOKEN.\n3. Turn the workflow on. Copy the Production URL from **End of Call**.\n4. Paste that URL into Vapi as the assistant server URL (end-of-call-report), or into Twilio's status/hangup callback.\n\nThe webhook answers 200 right away. A second event with the same call ID does not create another contact.",
+        "height": 340,
+        "width": 460
+      },
+      "id": "3f765f8d-1e5f-470d-9e1a-75fef0e506df",
+      "name": "Read Me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -420
+      ]
+    }
+  ],
+  "connections": {
+    "End of Call": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Parse Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Event": {
+      "main": [
+        [
+          {
+            "node": "Dedupe Call ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe Call ID": {
+      "main": [
+        [
+          {
+            "node": "Write to GHL?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Owner?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to GHL?": {
+      "main": [
+        [
+          {
+            "node": "Upsert GHL Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Owner?": {
+      "main": [
+        [
+          {
+            "node": "Owner Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "builtBy": "Bobby Ve, No BS AI"
+  },
+  "tags": []
+}
